@@ -1,55 +1,34 @@
 using System;
-using System.Diagnostics;
 using System.Runtime.InteropServices.JavaScript;
 using System.Threading.Tasks;
 
-Console.WriteLine("Hello, Browser!");
+Console.WriteLine("GodotWebHost: .NET WASM runtime initialized");
 
-if (args.Length == 1 && args[0] == "start")
-    StopwatchSample.Start();
+try
+{
+    Console.WriteLine("GodotWebHost: Loading LibGodot side module...");
+    await GodotBridge.LoadGodotAsync();
+    Console.WriteLine("GodotWebHost: LibGodot loaded successfully!");
+
+    Console.WriteLine("GodotWebHost: Creating Godot instance...");
+    int result = GodotBridge.CreateInstance();
+    Console.WriteLine($"GodotWebHost: CreateInstance returned: {result}");
+}
+catch (Exception ex)
+{
+    Console.WriteLine($"GodotWebHost: Error - {ex.GetType().Name}: {ex.Message}");
+}
 
 while (true)
 {
-    StopwatchSample.Render();
     await Task.Delay(1000);
 }
 
-partial class StopwatchSample
+partial class GodotBridge
 {
-    private static Stopwatch stopwatch = new();
+    [JSImport("godotBridge.loadGodot", "main.js")]
+    public static partial Task LoadGodotAsync();
 
-    public static void Start() => stopwatch.Start();
-    public static void Render() => SetInnerText("#time", stopwatch.Elapsed.ToString(@"mm\:ss"));
-    
-    [JSImport("dom.setInnerText", "main.js")]
-    internal static partial void SetInnerText(string selector, string content);
-
-    [JSExport]
-    internal static bool Toggle()
-    {
-        if (stopwatch.IsRunning)
-        {
-            stopwatch.Stop();
-            return false;
-        }
-        else
-        {
-            stopwatch.Start();
-            return true;
-        }
-    }
-
-    [JSExport]
-    internal static void Reset()
-    {
-        if (stopwatch.IsRunning)
-            stopwatch.Restart();
-        else
-            stopwatch.Reset();
-
-        Render();
-    }
-
-    [JSExport]
-    internal static bool IsRunning() => stopwatch.IsRunning;
+    [JSImport("godotBridge.createInstance", "main.js")]
+    public static partial int CreateInstance();
 }
