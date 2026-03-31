@@ -1,10 +1,22 @@
 import { dotnet } from "./_framework/dotnet.js";
 
-let godotInstance = null;
+let godotModule = null;
+let engineRunning = false;
 
 const { setModuleImports, getConfig, runMain } = await dotnet
   .withApplicationArguments("start")
   .create();
+
+// Helper to resolve a GOT symbol to a callable function via wasmTable
+function resolveGotFunc(name) {
+  if (godotModule && godotModule.GOT && godotModule.wasmTable) {
+    const entry = godotModule.GOT[name];
+    if (entry) {
+      return godotModule.wasmTable.get(entry.value);
+    }
+  }
+  return null;
+}
 
 setModuleImports("main.js", {
   godotBridge: {
@@ -34,8 +46,25 @@ setModuleImports("main.js", {
         printErr: (text) => console.error("Godot:", text),
       });
 
-      godotInstance = module;
+      godotModule = module;
       console.log("JS: Godot main module initialized!");
+
+      // Initialize Godot's internal config with the canvas element.
+      // This is normally done by engine.js but we're bypassing it.
+      const canvas = document.getElementById("canvas");
+      if (module.initConfig) {
+        module.initConfig({
+          canvas: canvas,
+          canvasResizePolicy: 0, // None - we control canvas size
+          locale: navigator.language || "en",
+          virtualKeyboard: false,
+          persistentDrops: false,
+          focusCanvas: true,
+        });
+        console.log("JS: initConfig called with canvas:", canvas.id);
+      } else {
+        console.warn("JS: initConfig not available on module");
+      }
 
       // Load the side module containing Godot engine + LibGodot
       if (!module.loadDynamicLibrary) {
@@ -51,38 +80,28 @@ setModuleImports("main.js", {
       });
       console.log("JS: Side module loaded!");
 
-      // Wire up LibGodot entry points via GOT + wasmTable
-      if (module.GOT && module.wasmTable) {
-        const createGot = module.GOT.libgodot_create_godot_instance;
-        const destroyGot = module.GOT.libgodot_destroy_godot_instance;
-        const initGot = module.GOT.minimal_gdextension_init;
+      // Wire up all LibGodot entry points via GOT + wasmTable
+      const symbols = [
+        "libgodot_create_godot_instance",
+        "libgodot_destroy_godot_instance",
+        "minimal_gdextension_init",
+        "libgodot_web_start",
+        "libgodot_web_iteration",
+        "libgodot_web_stop",
+      ];
 
-        if (createGot) {
-          module._libgodot_create_godot_instance = module.wasmTable.get(
-            createGot.value,
-          );
-          console.log("JS: Wired up libgodot_create_godot_instance");
-        }
-        if (destroyGot) {
-          module._libgodot_destroy_godot_instance = module.wasmTable.get(
-            destroyGot.value,
-          );
-          console.log("JS: Wired up libgodot_destroy_godot_instance");
-        }
-        if (initGot) {
-          console.log(
-            "JS: Wired up minimal_gdextension_init, table index:",
-            initGot.value,
-          );
+      for (const name of symbols) {
+        const fn = resolveGotFunc(name);
+        if (fn) {
+          module["_" + name] = fn;
+          console.log(`JS: Wired up ${name}`);
         } else {
-          console.warn("JS: minimal_gdextension_init not found in GOT");
+          console.warn(`JS: ${name} not found in GOT`);
         }
       }
 
       if (!module._libgodot_create_godot_instance) {
-        throw new Error(
-          "LibGodot entry points not found after loading side module",
-        );
+        throw new Error("LibGodot entry points not found after loading side module");
       }
 
       console.log("JS: LibGodot entry points ready!");
@@ -107,13 +126,9 @@ setModuleImports("main.js", {
     },
 
     createInstance: () => {
-      if (!godotInstance) {
-        console.error("JS: Godot module not loaded");
+      if (!godotModule || !godotModule._libgodot_create_godot_instance) {
+        console.error("JS: Godot module not loaded or entry points missing");
         return -1;
-      }
-      if (!godotInstance._libgodot_create_godot_instance) {
-        console.error("JS: libgodot_create_godot_instance not found");
-        return 0;
       }
 
       console.log("JS: Calling libgodot_create_godot_instance...");
@@ -121,11 +136,11 @@ setModuleImports("main.js", {
       // Helper to allocate a C string in WASM memory
       const allocStr = (str) => {
         const len = str.length + 1;
-        const ptr = godotInstance._malloc(len);
+        const ptr = godotModule._malloc(len);
         for (let i = 0; i < str.length; i++) {
-          godotInstance.HEAPU8[ptr + i] = str.charCodeAt(i);
+          godotModule.HEAPU8[ptr + i] = str.charCodeAt(i);
         }
-        godotInstance.HEAPU8[ptr + str.length] = 0;
+        godotModule.HEAPU8[ptr + str.length] = 0;
         return ptr;
       };
 
@@ -135,35 +150,84 @@ setModuleImports("main.js", {
       const arg2 = allocStr("/game.pck");
 
       // Create argv array (3 pointers, 4 bytes each)
-      const argvPtr = godotInstance._malloc(3 * 4);
-      const HEAP32 = new Int32Array(godotInstance.HEAPU8.buffer);
+      const argvPtr = godotModule._malloc(3 * 4);
+      const HEAP32 = new Int32Array(godotModule.HEAPU8.buffer);
       HEAP32[argvPtr >> 2] = arg0;
       HEAP32[(argvPtr >> 2) + 1] = arg1;
       HEAP32[(argvPtr >> 2) + 2] = arg2;
 
       // Get the init function pointer from GOT (WASM table index)
       const initPtr =
-        godotInstance.GOT && godotInstance.GOT.minimal_gdextension_init
-          ? godotInstance.GOT.minimal_gdextension_init.value
+        godotModule.GOT && godotModule.GOT.minimal_gdextension_init
+          ? godotModule.GOT.minimal_gdextension_init.value
           : 0;
       console.log("JS: Using init function pointer:", initPtr);
 
-      const ptr = godotInstance._libgodot_create_godot_instance(
-        3,
-        argvPtr,
-        initPtr,
-      );
+      const ptr = godotModule._libgodot_create_godot_instance(3, argvPtr, initPtr);
       console.log("JS: Got instance pointer:", ptr);
 
       // Clean up allocated strings
-      godotInstance._free(arg0);
-      godotInstance._free(arg1);
-      godotInstance._free(arg2);
-      godotInstance._free(argvPtr);
+      godotModule._free(arg0);
+      godotModule._free(arg1);
+      godotModule._free(arg2);
+      godotModule._free(argvPtr);
 
       return ptr;
     },
+
+    startEngine: () => {
+      if (!godotModule || !godotModule._libgodot_web_start) {
+        console.error("JS: libgodot_web_start not available");
+        return 0;
+      }
+
+      console.log("JS: Calling libgodot_web_start...");
+      const result = godotModule._libgodot_web_start();
+      console.log("JS: libgodot_web_start returned:", result);
+
+      if (result === 1) {
+        // Start the render loop
+        engineRunning = true;
+        console.log("JS: Starting requestAnimationFrame render loop...");
+        requestAnimationFrame(renderLoop);
+      }
+
+      return result;
+    },
+
+    stopEngine: () => {
+      console.log("JS: Stopping engine...");
+      engineRunning = false;
+      if (godotModule && godotModule._libgodot_web_stop) {
+        godotModule._libgodot_web_stop();
+      }
+    },
   },
 });
+
+function renderLoop() {
+  if (!engineRunning || !godotModule || !godotModule._libgodot_web_iteration) {
+    return;
+  }
+
+  try {
+    // iteration() returns 0 to continue, non-zero to quit
+    const shouldQuit = godotModule._libgodot_web_iteration();
+    if (shouldQuit) {
+      console.log("JS: Engine requested quit");
+      engineRunning = false;
+      if (godotModule._libgodot_web_stop) {
+        godotModule._libgodot_web_stop();
+      }
+      return;
+    }
+  } catch (e) {
+    console.error("JS: Error during iteration:", e.message);
+    engineRunning = false;
+    return;
+  }
+
+  requestAnimationFrame(renderLoop);
+}
 
 await runMain();
