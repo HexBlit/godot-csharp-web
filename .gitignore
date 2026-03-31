@@ -1,1 +1,3 @@
 *.wasm 
+GodotWebHost/bin/*
+GodotWebHost/obj/*
